@@ -1,91 +1,30 @@
 import os
-
-os.environ['HF_HOME'] = os.path.join(os.path.dirname(__file__), 'hf_download')
-HF_TOKEN = None
-
-import lib_omost.memory_management as memory_management
 import uuid
-
 import torch
 import numpy as np
 import gradio as gr
 import tempfile
+from threading import Thread
+from PIL import Image
+from transformers import (AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer, 
+                          CLIPTextModel, CLIPTokenizer)
+from diffusers import AutoencoderKL, UNet2DConditionModel
+from diffusers.models.attention_processor import AttnProcessor2_0
+from lib_omost.pipeline import StableDiffusionXLOmostPipeline
+from chat_interface import ChatInterface
+from transformers.generation.stopping_criteria import StoppingCriteriaList
+import lib_omost.canvas as omost_canvas
+import lib_omost.memory_management as memory_management
+
+os.environ['HF_HOME'] = os.path.join(os.path.dirname(__file__), 'hf_download')
+HF_TOKEN = None
 
 gradio_temp_dir = os.path.join(tempfile.gettempdir(), 'gradio')
 os.makedirs(gradio_temp_dir, exist_ok=True)
 
-from threading import Thread
-
 # Phi3 Hijack
 from transformers.models.phi3.modeling_phi3 import Phi3PreTrainedModel
-
 Phi3PreTrainedModel._supports_sdpa = True
-
-from PIL import Image
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
-from diffusers import AutoencoderKL, UNet2DConditionModel
-from diffusers.models.attention_processor import AttnProcessor2_0
-from transformers import CLIPTextModel, CLIPTokenizer
-from lib_omost.pipeline import StableDiffusionXLOmostPipeline
-from chat_interface import ChatInterface
-from transformers.generation.stopping_criteria import StoppingCriteriaList
-
-import lib_omost.canvas as omost_canvas
-
-
-# SDXL
-
-sdxl_name = 'SG161222/RealVisXL_V4.0'
-# sdxl_name = 'stabilityai/stable-diffusion-xl-base-1.0'
-
-tokenizer = CLIPTokenizer.from_pretrained(
-    sdxl_name, subfolder="tokenizer")
-tokenizer_2 = CLIPTokenizer.from_pretrained(
-    sdxl_name, subfolder="tokenizer_2")
-text_encoder = CLIPTextModel.from_pretrained(
-    sdxl_name, subfolder="text_encoder", torch_dtype=torch.float16, variant="fp16")
-text_encoder_2 = CLIPTextModel.from_pretrained(
-    sdxl_name, subfolder="text_encoder_2", torch_dtype=torch.float16, variant="fp16")
-vae = AutoencoderKL.from_pretrained(
-    sdxl_name, subfolder="vae", torch_dtype=torch.bfloat16, variant="fp16")  # bfloat16 vae
-unet = UNet2DConditionModel.from_pretrained(
-    sdxl_name, subfolder="unet", torch_dtype=torch.float16, variant="fp16")
-
-unet.set_attn_processor(AttnProcessor2_0())
-vae.set_attn_processor(AttnProcessor2_0())
-
-pipeline = StableDiffusionXLOmostPipeline(
-    vae=vae,
-    text_encoder=text_encoder,
-    tokenizer=tokenizer,
-    text_encoder_2=text_encoder_2,
-    tokenizer_2=tokenizer_2,
-    unet=unet,
-    scheduler=None,  # We completely give up diffusers sampling system and use A1111's method
-)
-
-memory_management.unload_all_models([text_encoder, text_encoder_2, vae, unet])
-
-# LLM
-
-# llm_name = 'lllyasviel/omost-phi-3-mini-128k-8bits'
-llm_name = 'lllyasviel/omost-llama-3-8b-4bits'
-# llm_name = 'lllyasviel/omost-dolphin-2.9-llama3-8b-4bits'
-
-llm_model = AutoModelForCausalLM.from_pretrained(
-    llm_name,
-    torch_dtype=torch.bfloat16,  # This is computation type, not load/memory type. The loading quant type is baked in config.
-    token=HF_TOKEN,
-    device_map="auto"  # This will load model to gpu with an offload system
-)
-
-llm_tokenizer = AutoTokenizer.from_pretrained(
-    llm_name,
-    token=HF_TOKEN
-)
-
-memory_management.unload_all_models(llm_model)
-
 
 @torch.inference_mode()
 def pytorch2numpy(imgs):
@@ -97,22 +36,19 @@ def pytorch2numpy(imgs):
         results.append(y)
     return results
 
-
 @torch.inference_mode()
 def numpy2pytorch(imgs):
     h = torch.from_numpy(np.stack(imgs, axis=0)).float() / 127.5 - 1.0
     h = h.movedim(-1, 1)
     return h
 
-
 def resize_without_crop(image, target_width, target_height):
     pil_image = Image.fromarray(image)
     resized_image = pil_image.resize((target_width, target_height), Image.LANCZOS)
     return np.array(resized_image)
 
-
 @torch.inference_mode()
-def chat_fn(message: str, history: list, seed:int, temperature: float, top_p: float, max_new_tokens: int) -> str:
+def chat_fn(message: str, history: list, seed:int, temperature: float, top_p: float, max_new_tokens: int, llm_name: str) -> str:
     np.random.seed(int(seed))
     torch.manual_seed(int(seed))
 
@@ -124,6 +60,18 @@ def chat_fn(message: str, history: list, seed:int, temperature: float, top_p: fl
         conversation.extend([{"role": "user", "content": user}, {"role": "assistant", "content": assistant}])
 
     conversation.append({"role": "user", "content": message})
+
+    llm_model = AutoModelForCausalLM.from_pretrained(
+        llm_name,
+        torch_dtype=torch.bfloat16,
+        token=HF_TOKEN,
+        device_map="auto"
+    )
+
+    llm_tokenizer = AutoTokenizer.from_pretrained(
+        llm_name,
+        token=HF_TOKEN
+    )
 
     memory_management.load_models_to_gpu(llm_model)
 
@@ -163,11 +111,9 @@ def chat_fn(message: str, history: list, seed:int, temperature: float, top_p: fl
     outputs = []
     for text in streamer:
         outputs.append(text)
-        # print(outputs)
         yield "".join(outputs), interrupter
 
     return
-
 
 @torch.inference_mode()
 def post_chat(history):
@@ -184,10 +130,9 @@ def post_chat(history):
 
     return canvas_outputs, gr.update(visible=canvas_outputs is not None), gr.update(interactive=len(history) > 0)
 
-
 @torch.inference_mode()
 def diffusion_fn(chatbot, canvas_outputs, num_samples, seed, image_width, image_height,
-                 highres_scale, steps, cfg, highres_steps, highres_denoise, negative_prompt):
+                 highres_scale, steps, cfg, highres_steps, highres_denoise, negative_prompt, sdxl_name):
 
     use_initial_latent = False
     eps = 0.05
@@ -196,7 +141,33 @@ def diffusion_fn(chatbot, canvas_outputs, num_samples, seed, image_width, image_
 
     rng = torch.Generator(device=memory_management.gpu).manual_seed(seed)
 
-    memory_management.load_models_to_gpu([text_encoder, text_encoder_2])
+    tokenizer = CLIPTokenizer.from_pretrained(
+        sdxl_name, subfolder="tokenizer")
+    tokenizer_2 = CLIPTokenizer.from_pretrained(
+        sdxl_name, subfolder="tokenizer_2")
+    text_encoder = CLIPTextModel.from_pretrained(
+        sdxl_name, subfolder="text_encoder", torch_dtype=torch.float16, variant="fp16")
+    text_encoder_2 = CLIPTextModel.from_pretrained(
+        sdxl_name, subfolder="text_encoder_2", torch_dtype=torch.float16, variant="fp16")
+    vae = AutoencoderKL.from_pretrained(
+        sdxl_name, subfolder="vae", torch_dtype=torch.bfloat16, variant="fp16")  # bfloat16 vae
+    unet = UNet2DConditionModel.from_pretrained(
+        sdxl_name, subfolder="unet", torch_dtype=torch.float16, variant="fp16")
+
+    unet.set_attn_processor(AttnProcessor2_0())
+    vae.set_attn_processor(AttnProcessor2_0())
+
+    pipeline = StableDiffusionXLOmostPipeline(
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        text_encoder_2=text_encoder_2,
+        tokenizer_2=tokenizer_2,
+        unet=unet,
+        scheduler=None,  # We completely give up diffusers sampling system and use A1111's method
+    )
+
+    memory_management.load_models_to_gpu([text_encoder, text_encoder_2, vae, unet])
 
     positive_cond, positive_pooler, negative_cond, negative_pooler = pipeline.all_conds_from_canvas(canvas_outputs, negative_prompt)
 
@@ -278,7 +249,6 @@ def diffusion_fn(chatbot, canvas_outputs, num_samples, seed, image_width, image_
 
     return chatbot
 
-
 css = '''
 code {white-space: pre-wrap !important;}
 .gradio-container {max-width: none !important;}
@@ -305,6 +275,16 @@ with gr.Blocks(
 
             with gr.Accordion(open=True, label='Language Model'):
                 with gr.Group():
+                    llm_name_dropdown = gr.Dropdown(
+                        label="LLM Model Name",
+                        choices=[
+                            'lllyasviel/omost-phi-3-mini-128k-8bits',
+                            'lllyasviel/omost-llama-3-8b-4bits',
+                            'lllyasviel/omost-dolphin-2.9-llama3-8b-4bits'
+                        ],
+                        value='lllyasviel/omost-llama-3-8b-4bits'
+                    )
+                    llm_name_input = gr.Textbox(label="Custom LLM Model Name", placeholder="Enter custom LLM model name")
                     with gr.Row():
                         temperature = gr.Slider(
                             minimum=0.0,
@@ -326,6 +306,7 @@ with gr.Blocks(
                         label="Max New Tokens")
             with gr.Accordion(open=True, label='Image Diffusion Model'):
                 with gr.Group():
+                    sdxl_name_input = gr.Textbox(label="SDXL Model Name", value='SG161222/RealVisXL_V4.0')
                     with gr.Row():
                         image_width = gr.Slider(label="Image Width", minimum=256, maximum=2048, value=896, step=64)
                         image_height = gr.Slider(label="Image Height", minimum=256, maximum=2048, value=1152, step=64)
@@ -364,19 +345,22 @@ with gr.Blocks(
                 retry_btn=retry_btn,
                 undo_btn=undo_btn,
                 clear_btn=clear_btn,
-                additional_inputs=[seed, temperature, top_p, max_new_tokens],
+                additional_inputs=[seed, temperature, top_p, max_new_tokens, llm_name_dropdown, llm_name_input],
                 examples=examples
             )
+
+    def get_llm_name(llm_dropdown_value, llm_input_value):
+        return llm_input_value if llm_input_value else llm_dropdown_value
 
     render_button.click(
         fn=diffusion_fn, inputs=[
             chatInterface.chatbot, canvas_state,
             num_samples, seed, image_width, image_height, highres_scale,
-            steps, cfg, highres_steps, highres_denoise, n_prompt
+            steps, cfg, highres_steps, highres_denoise, n_prompt, sdxl_name_input
         ], outputs=[chatInterface.chatbot]).then(
         fn=lambda x: x, inputs=[
             chatInterface.chatbot
         ], outputs=[chatInterface.chatbot_state])
 
 if __name__ == "__main__":
-    demo.queue().launch(inbrowser=True, server_name='0.0.0.0')
+    demo.queue().launch(server_name='0.0.0.0', server_port=7860)
